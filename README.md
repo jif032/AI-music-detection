@@ -31,7 +31,7 @@ Run the notebooks in the following order:
   Downloads datasets from Hugging Face, filters (Udio/Suno), and organizes raw data.
 
 - **02_EDA.ipynb**  
-  Performs exploratory data analysis, computes MERT embeddings, and generates the usable metadata manifest.
+  Performs exploratory data analysis, included analysis of the MERT embeddings, and generates the usable metadata manifest.
 
 - **03_Models_Experimentations.ipynb**  
   Core experimentation suite including:
@@ -53,7 +53,7 @@ Run the notebooks in the following order:
   Audio chunking logic and PyTorch Dataset/DataLoader definitions.
 
 - **mert_mining.py**  
-  Hard-negative mining using MERT embeddings.
+  Hard-negative mining using KNN on MERT embeddings.
 
 - **spectrogram.py**  
   Efficient Mel-spectrogram generation (GPU/CPU).
@@ -74,19 +74,18 @@ This project uses **uv** (recommended) or standard pip:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/your-repo-name.git
-cd your-repo-name
+git clone https://github.com/NikolozDarsalia/AI_Music_Detection.git
+cd AI_Music_Detection
 
 # Install dependencies
 uv sync
-# OR
-pip install -r requirements.txt
+
 ```
 
 ### 2. Authentication
 To access datasets from Hugging Face:
 - Create a folder named tokens/ in the root directory
-- Inside it, create a file (e.g., hf_token.txt)
+- Inside it, create a file (e.g., token_hf.txt)
 - Paste your Hugging Face Read Token into the file
 
 ## 🔄 Data Pipeline
@@ -117,7 +116,3 @@ I evaluated four architectures on a 6,000-chunk subset to quickly identify the m
 
 ## ⚖️ License
 This project is licensed under the MIT License – see the LICENSE file for details.
-
-## ▶️ Next Step
-Start with **01_Data_Collection.ipynb** to begin the data ingestion and pipeline setup.
-
