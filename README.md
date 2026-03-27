@@ -100,9 +100,9 @@ data/
   ├── chunks/          # Chunk-level CSVs + MERT embeddings
   ├── spectrograms/    # Precomputed .npy files
   ├── splits/          # Train/val/test splits
-  ├── checkpoints/     # Model weights
-  ├── results/         # JSON metrics
-  └── logs/            # Plots, confusion matrices, attribution maps
+checkpoints/           # Model weights
+results/               # JSON metrics
+logs/                  # Plots, confusion matrices, attribution maps
 ```
 
 ## 🧠 Experimental Results
