@@ -18,3 +18,12 @@ token_*.txt
 # tabular files
 *.csv
 *.npy
+
+# plots
+*.png
+
+# models
+*.pt
+
+# model stats
+*.json
