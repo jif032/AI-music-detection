@@ -15,6 +15,9 @@
 #     can group chunks by track_id without a separate lookup
 # =============================================================================
 
+# =============================================================================
+# dataset.py
+# =============================================================================
 import numpy as np
 import pandas as pd
 import torch
@@ -49,6 +52,14 @@ def spec_augment(
     return spec
 
 
+# ── Config attribute helpers ──────────────────────────────────────────────────
+
+
+def _get(config, attr: str, default):
+    """Safely read an attribute from config with a fallback default."""
+    return getattr(config, attr, default)
+
+
 # ── Base Dataset ──────────────────────────────────────────────────────────────
 
 
@@ -63,13 +74,9 @@ class _BaseDataset(Dataset):
         self.config = config
         self.split = split
         self.is_train = split == "train"
-
-        # augment=None → follow split (True for train, False for val/test)
-        # augment=False → always off (used for train metric evaluation)
         self.augment = self.is_train if augment is None else augment
 
         self.df = manifest[manifest["split"] == split].reset_index(drop=True)
-
         if len(self.df) == 0:
             raise ValueError(f"No chunks found for split='{split}'")
 
@@ -109,34 +116,39 @@ class _BaseDataset(Dataset):
         }
 
     def _load_spec(self, idx: int) -> np.ndarray:
-        npy_path = self.df.iloc[idx]["npy_path"]
-        return np.load(npy_path).astype(np.float32)
+        return np.load(self.df.iloc[idx]["npy_path"]).astype(np.float32)
 
     def _maybe_augment(self, spec: torch.Tensor) -> torch.Tensor:
-        """Apply SpecAugment only when self.augment is True."""
-        if self.augment and self.config.USE_AUGMENTATION:
-            spec = spec_augment(
-                spec=spec,
-                freq_mask_param=self.config.FREQ_MASK_PARAM,
-                time_mask_param=self.config.TIME_MASK_PARAM,
-                n_freq_masks=self.config.N_FREQ_MASKS,
-                n_time_masks=self.config.N_TIME_MASKS,
-            )
-        return spec
+        """Apply SpecAugment only when self.augment is True AND config has params."""
+        if not self.augment:
+            return spec
+        # Read augmentation params with safe defaults (off if not present)
+        use_aug = _get(self.config, "USE_AUGMENTATION", False)
+        if not use_aug:
+            return spec
+        return spec_augment(
+            spec=spec,
+            freq_mask_param=_get(self.config, "FREQ_MASK_PARAM", 15),
+            time_mask_param=_get(self.config, "TIME_MASK_PARAM", 50),
+            n_freq_masks=_get(self.config, "N_FREQ_MASKS", 2),
+            n_time_masks=_get(self.config, "N_TIME_MASKS", 2),
+        )
 
 
-# ── CNN Dataset ───────────────────────────────────────────────────────────────
+# ── CNN / MLP Dataset ─────────────────────────────────────────────────────────
 
 
 class MelSpecDataset(_BaseDataset):
-    """CNN dataset — returns (1, n_mels, time_frames)."""
+    """
+    For CNN and MLP models.
+    Returns (1, n_mels, time_frames) — MLP flattens internally.
+    """
 
     def __init__(self, manifest, split, config, augment=None):
         super().__init__(manifest, split, config, augment=augment)
 
     def __getitem__(self, idx: int):
-        spec = self._load_spec(idx)
-        spec = torch.from_numpy(spec)
+        spec = torch.from_numpy(self._load_spec(idx))
         spec = self._maybe_augment(spec)
         spec = spec.unsqueeze(0)
         label = torch.tensor(int(self.labels[idx]), dtype=torch.long)
@@ -147,26 +159,25 @@ class MelSpecDataset(_BaseDataset):
 
 
 class MelSpecSeqDataset(_BaseDataset):
-    """CNN+LSTM/GRU dataset — returns (n_segments, 1, n_mels, segment_frames)."""
+    """
+    For CNN+LSTM / CNN+GRU.
+    Returns (n_segments, 1, n_mels, segment_frames).
+    """
 
     def __init__(self, manifest, split, config, segment_frames=43, augment=None):
         super().__init__(manifest, split, config, augment=augment)
         self.segment_frames = segment_frames
         self.n_segments = config.SPEC_TIME_FRAMES // segment_frames
-        log.info(
-            f"  Sequence mode: {self.n_segments} segments × "
-            f"{segment_frames} frames each"
-        )
+        log.info(f"  Sequence: {self.n_segments} segments × {segment_frames} frames")
 
     def __getitem__(self, idx: int):
-        spec = self._load_spec(idx)
-        spec = torch.from_numpy(spec)
+        spec = torch.from_numpy(self._load_spec(idx))
         spec = self._maybe_augment(spec)
 
-        usable_frames = self.n_segments * self.segment_frames
-        spec = spec[:, :usable_frames]
+        usable = self.n_segments * self.segment_frames
         spec = (
-            spec.reshape(self.config.N_MELS, self.n_segments, self.segment_frames)
+            spec[:, :usable]
+            .reshape(self.config.N_MELS, self.n_segments, self.segment_frames)
             .permute(1, 0, 2)
             .unsqueeze(1)
         )
@@ -179,7 +190,7 @@ class MelSpecSeqDataset(_BaseDataset):
 
 
 class ASTDataset(_BaseDataset):
-    """AST dataset — returns raw audio at 16kHz."""
+    """For AST fine-tuning — returns raw audio at 16kHz."""
 
     AST_SR = 16000
 
@@ -198,7 +209,7 @@ class ASTDataset(_BaseDataset):
         )
         rms = np.sqrt(np.mean(audio**2))
         if rms > 1e-8:
-            audio = audio * (self.config.RMS_TARGET / rms)
+            audio = audio * (_get(self.config, "RMS_TARGET", 0.1) / rms)
         if len(audio) < self.expected_samples:
             audio = np.pad(audio, (0, self.expected_samples - len(audio)))
         audio = audio[: self.expected_samples]
@@ -210,30 +221,48 @@ class ASTDataset(_BaseDataset):
 # ── DataLoader factory ────────────────────────────────────────────────────────
 
 
+def _resolve_dataset_class(mtype: str):
+    """Map model type string to (DatasetClass, dataset_kwargs)."""
+    if mtype in ("mlp", "cnn"):
+        return MelSpecDataset, {}
+    elif mtype in ("cnn_lstm", "cnn_gru"):
+        return MelSpecSeqDataset, {"segment_frames": 43}
+    elif mtype == "ast":
+        return ASTDataset, {}
+    else:
+        raise ValueError(
+            f"Unknown model_type='{mtype}'. "
+            f"Choose from: mlp, cnn, cnn_lstm, cnn_gru, ast"
+        )
+
+
 def build_dataloaders(
     manifest: pd.DataFrame,
     config,
     model_type: str | None = None,
+    batch_size: int | None = None,
 ) -> dict[str, DataLoader]:
+    """
+    Build train / val / test DataLoaders.
 
-    mtype = (model_type or config.MODEL_TYPE).lower()
+    Parameters
+    ----------
+    manifest   : spectrogram manifest DataFrame
+    config     : config module (only fixed params needed — paths, spec shape)
+    model_type : "mlp" | "cnn" | "cnn_lstm" | "cnn_gru" | "ast"
+                 Falls back to config.MODEL_TYPE if not given.
+    batch_size : override batch size. Falls back to config.BATCH_SIZE
+                 or 64 if neither is set.
+    """
+    mtype = (model_type or _get(config, "MODEL_TYPE", "cnn")).lower()
+    bs = batch_size or _get(config, "BATCH_SIZE", 64)
 
-    if mtype == "cnn":
-        DatasetClass = MelSpecDataset
-        dataset_kwargs = {}
-    elif mtype in ("cnn_lstm", "cnn_gru"):
-        DatasetClass = MelSpecSeqDataset
-        dataset_kwargs = {"segment_frames": 43}
-    elif mtype == "ast":
-        DatasetClass = ASTDataset
-        dataset_kwargs = {}
-    else:
-        raise ValueError(f"Unknown model_type='{mtype}'.")
-
-    log.info(f"\nBuilding DataLoaders — model_type='{mtype}'")
+    DatasetClass, dataset_kwargs = _resolve_dataset_class(mtype)
+    log.info(f"\nBuilding DataLoaders — model_type='{mtype}', batch_size={bs}")
 
     pin = torch.cuda.is_available()
     n_workers = 0 if platform.system() == "Darwin" else 4
+    use_sampler = _get(config, "USE_WEIGHTED_SAMPLER", True)
 
     loaders = {}
     for split in ["train", "val", "test"]:
@@ -248,7 +277,7 @@ def build_dataloaders(
             **dataset_kwargs,
         )
 
-        if split == "train" and config.USE_WEIGHTED_SAMPLER:
+        if split == "train" and use_sampler:
             sampler = _make_weighted_sampler(dataset)
             shuffle = False
         else:
@@ -257,7 +286,7 @@ def build_dataloaders(
 
         loaders[split] = DataLoader(
             dataset,
-            batch_size=config.BATCH_SIZE,
+            batch_size=bs,
             shuffle=shuffle,
             sampler=sampler,
             num_workers=n_workers,
@@ -266,11 +295,7 @@ def build_dataloaders(
             collate_fn=_collate_fn,
         )
 
-        log.info(
-            f"  {split:5s} loader: {len(dataset)} chunks | "
-            f"{len(loaders[split])} batches | "
-            f"batch_size={config.BATCH_SIZE}"
-        )
+        log.info(f"  {split:5s}: {len(dataset)} chunks | {len(loaders[split])} batches")
 
     return loaders
 
@@ -280,28 +305,22 @@ def build_eval_loader(
     config,
     split: str = "train",
     model_type: str | None = None,
+    batch_size: int | None = None,
 ) -> DataLoader:
     """
-    Build a DataLoader for metric evaluation with augmentation disabled.
-    Used to compute honest train metrics without SpecAugment corruption.
+    Augmentation-free DataLoader for honest metric computation.
+    Always uses augment=False regardless of config settings.
     """
-    mtype = (model_type or config.MODEL_TYPE).lower()
+    mtype = (model_type or _get(config, "MODEL_TYPE", "cnn")).lower()
+    bs = batch_size or _get(config, "BATCH_SIZE", 64)
 
-    if mtype == "cnn":
-        DatasetClass = MelSpecDataset
-        dataset_kwargs = {}
-    elif mtype in ("cnn_lstm", "cnn_gru"):
-        DatasetClass = MelSpecSeqDataset
-        dataset_kwargs = {"segment_frames": 43}
-    else:
-        DatasetClass = MelSpecDataset
-        dataset_kwargs = {}
+    DatasetClass, dataset_kwargs = _resolve_dataset_class(mtype)
 
     dataset = DatasetClass(
         manifest=manifest,
         split=split,
         config=config,
-        augment=False,  # ← always off for evaluation
+        augment=False,  # always off
         **dataset_kwargs,
     )
 
@@ -309,7 +328,7 @@ def build_eval_loader(
 
     return DataLoader(
         dataset,
-        batch_size=config.BATCH_SIZE,
+        batch_size=bs,
         shuffle=False,
         num_workers=n_workers,
         pin_memory=False,
@@ -318,27 +337,21 @@ def build_eval_loader(
     )
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
 def _make_weighted_sampler(dataset: _BaseDataset) -> WeightedRandomSampler:
     labels = dataset.labels
     n_human = (labels == 0).sum()
     n_ai = (labels == 1).sum()
     n_total = len(labels)
 
-    weight_human = n_total / (2 * n_human) if n_human > 0 else 1.0
-    weight_ai = n_total / (2 * n_ai) if n_ai > 0 else 1.0
+    w_human = n_total / (2 * n_human) if n_human > 0 else 1.0
+    w_ai = n_total / (2 * n_ai) if n_ai > 0 else 1.0
+    weights = torch.from_numpy(np.where(labels == 0, w_human, w_ai)).double()
 
-    weights = np.where(labels == 0, weight_human, weight_ai)
-    weights = torch.from_numpy(weights).double()
-
-    log.info(
-        f"  WeightedSampler: human_weight={weight_human:.3f}, ai_weight={weight_ai:.3f}"
-    )
-
-    return WeightedRandomSampler(
-        weights=weights,
-        num_samples=n_total,
-        replacement=True,
-    )
+    log.info(f"  WeightedSampler: human={w_human:.3f}, ai={w_ai:.3f}")
+    return WeightedRandomSampler(weights, num_samples=n_total, replacement=True)
 
 
 def _collate_fn(batch):

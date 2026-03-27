@@ -1,14 +1,6 @@
 # =============================================================================
 # sampling.py
 # =============================================================================
-# Generates a chunk index from a track-level split DataFrame.
-# No audio is loaded here — we only record (file_path, start_sec, label,
-# source, split) for each chunk. Audio loading happens later in spectrogram.py.
-#
-# Weighted percentile sampling ensures chunks are drawn from musically
-# informative regions of each track, with configurable edge probabilities.
-# =============================================================================
-
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -17,17 +9,24 @@ import logging
 log = logging.getLogger(__name__)
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
-
-
-def _n_chunks_for_source(source_name: str, config) -> int:
-    """Return configured chunk count for a given source."""
-    mapping = {
-        "FMA": config.N_CHUNKS_FMA,
-        "Udio": config.N_CHUNKS_UDIO,
-        "Suno": config.N_CHUNKS_SUNO,
-    }
-    return mapping.get(source_name, config.N_CHUNKS_UDIO)
+def _n_chunks_for_source(source_name: str, is_train: bool, config) -> int:
+    """Return configured chunk count for a source and split type."""
+    if is_train:
+        mapping = {
+            "FMA": config.N_CHUNKS_FMA_TRAIN,
+            "Udio": config.N_CHUNKS_UDIO_TRAIN,
+            "Suno": config.N_CHUNKS_SUNO_TRAIN,
+        }
+    else:
+        mapping = {
+            "FMA": config.N_CHUNKS_FMA_EVAL,
+            "Udio": config.N_CHUNKS_UDIO_EVAL,
+            "Suno": config.N_CHUNKS_SUNO_EVAL,
+        }
+    return mapping.get(
+        source_name,
+        config.N_CHUNKS_UDIO_TRAIN if is_train else config.N_CHUNKS_UDIO_EVAL,
+    )
 
 
 def _sample_start_positions(
@@ -39,21 +38,11 @@ def _sample_start_positions(
     rng: np.random.Generator,
 ) -> list[float]:
     """
-    Sample n_chunks start positions (in seconds) from a track of
-    duration_sec using weighted percentile region sampling.
-
-    Strategy:
-      1. For each chunk, pick a region according to region_probs.
-      2. Sample a uniform start position within that region, ensuring
-         the full chunk fits within the track.
-      3. Retry up to MAX_RETRIES times to avoid overlapping chunks
-         (soft constraint — overlap allowed if track is short).
-
-    Returns a list of start positions in seconds (may be < n_chunks
-    if the track is too short to fit all non-overlapping chunks).
+    Sample n_chunks start positions (seconds) using weighted
+    percentile region sampling with soft non-overlap constraint.
     """
     MAX_RETRIES = 20
-    MIN_GAP_SEC = chunk_sec * 0.5  # allow 50% overlap at most
+    MIN_GAP_SEC = chunk_sec * 0.5
 
     usable_duration = duration_sec - chunk_sec
     if usable_duration <= 0:
@@ -63,33 +52,21 @@ def _sample_start_positions(
     positions = []
 
     for _ in range(n_chunks):
-        for attempt in range(MAX_RETRIES):
-            # Pick region weighted by region_probs
+        for _ in range(MAX_RETRIES):
             region_idx = rng.choice(len(region_probs), p=region_probs)
-            lo = bounds_sec[region_idx]
-            hi = bounds_sec[region_idx + 1]
+            lo = max(0.0, bounds_sec[region_idx])
+            hi = min(usable_duration, bounds_sec[region_idx + 1])
 
-            # Clamp so the full chunk fits inside the track
-            lo_clamped = max(0.0, lo)
-            hi_clamped = min(usable_duration, hi)
-
-            if hi_clamped <= lo_clamped:
-                # Region too narrow for this track — try another region
+            if hi <= lo:
                 continue
 
-            start = float(rng.uniform(lo_clamped, hi_clamped))
-
-            # Check minimum gap from already-placed chunks (soft)
+            start = float(rng.uniform(lo, hi))
             too_close = any(abs(start - p) < MIN_GAP_SEC for p in positions)
             if not too_close or len(positions) == 0:
                 positions.append(start)
                 break
-        # If all retries exhausted, skip this chunk slot
 
     return positions
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
 
 
 def build_chunk_index(
@@ -98,26 +75,14 @@ def build_chunk_index(
     output_path: Path | None = None,
 ) -> pd.DataFrame:
     """
-    Build a chunk index DataFrame from a track-level split DataFrame.
+    Build a chunk index from a track-level split DataFrame.
 
-    Parameters
-    ----------
-    split_df    : output of splits.py — must have columns
-                  [file_path, label, source_name, duration_sec, split]
-    config      : config module
-    output_path : if given, saves the chunk index CSV here
+    Uses train chunk counts for split=="train" and eval chunk counts
+    for split=="val" and split=="test".
 
-    Returns
-    -------
-    DataFrame with columns:
-        chunk_id        unique integer id
-        file_path       source wav file
-        start_sec       chunk start position in seconds
-        end_sec         chunk end position in seconds
-        label           "human" | "ai"
-        source_name     "FMA" | "Udio" | "Suno"
-        split           "train" | "val" | "test"
-        track_id        integer — unique per file_path (for GroupKFold)
+    Returns DataFrame with columns:
+        chunk_id, file_path, start_sec, end_sec,
+        label, source_name, split, track_id
     """
     rng = np.random.default_rng(config.SEED)
 
@@ -127,18 +92,18 @@ def build_chunk_index(
 
     log.info(f"Building chunk index for {len(split_df)} tracks...")
 
-    # Assign integer track IDs (used later for GroupKFold & track-level eval)
     track_id_map = {fp: i for i, fp in enumerate(split_df["file_path"].unique())}
 
     rows = []
-    skipped_tracks = 0
+    skipped = 0
 
     for _, row in split_df.iterrows():
         if row["duration_sec"] < config.MIN_TRACK_DURATION:
-            skipped_tracks += 1
+            skipped += 1
             continue
 
-        n_chunks = _n_chunks_for_source(row["source_name"], config)
+        is_train = row["split"] == "train"
+        n_chunks = _n_chunks_for_source(row["source_name"], is_train, config)
 
         starts = _sample_start_positions(
             duration_sec=row["duration_sec"],
@@ -165,9 +130,9 @@ def build_chunk_index(
     chunk_df = pd.DataFrame(rows).reset_index(drop=True)
     chunk_df.insert(0, "chunk_id", range(len(chunk_df)))
 
-    if skipped_tracks:
+    if skipped:
         log.warning(
-            f"Skipped {skipped_tracks} tracks shorter than {config.MIN_TRACK_DURATION}s"
+            f"Skipped {skipped} tracks shorter than {config.MIN_TRACK_DURATION}s"
         )
 
     _log_chunk_summary(chunk_df)
@@ -186,21 +151,9 @@ def cap_ai_chunks(
     split: str = "train",
 ) -> pd.DataFrame:
     """
-    Cap AI chunks in a given split to match the human chunk count.
-    Operates per-split so val/test counts are not affected by train capping.
-
-    Capping is stratified by source — Suno and Udio are subsampled
-    proportionally to their original counts, preserving source diversity.
-
-    Parameters
-    ----------
-    chunk_df : full chunk index (all splits)
-    config   : config module
-    split    : which split to cap (typically "train")
-
-    Returns
-    -------
-    Full chunk_df with AI chunks in `split` capped, all other rows unchanged.
+    Cap AI chunks in training split to match human count.
+    Stratified by source to preserve Suno/Udio proportions.
+    Val/test splits are never capped.
     """
     rng = np.random.default_rng(config.SEED)
 
@@ -217,35 +170,29 @@ def cap_ai_chunks(
         log.info("AI chunks already ≤ human — no capping needed.")
         return chunk_df
 
-    # Stratified cap: preserve Suno/Udio proportions
     ai_chunks = chunk_df[ai_mask].copy()
     source_counts = ai_chunks["source_name"].value_counts()
     source_fracs = source_counts / source_counts.sum()
-    target_per_source = (source_fracs * n_human).round().astype(int)
+    target_per_src = (source_fracs * n_human).round().astype(int)
 
-    # Adjust rounding error so total == n_human
-    diff = n_human - target_per_source.sum()
+    diff = n_human - target_per_src.sum()
     if diff != 0:
-        largest = target_per_source.idxmax()
-        target_per_source[largest] += diff
+        target_per_src[target_per_src.idxmax()] += diff
 
     kept_ai_idx = []
-    for source, target in target_per_source.items():
-        source_idx = ai_chunks[ai_chunks["source_name"] == source].index.tolist()
-        n_keep = min(target, len(source_idx))
-        kept = rng.choice(source_idx, size=n_keep, replace=False)
+    for source, target in target_per_src.items():
+        src_idx = ai_chunks[ai_chunks["source_name"] == source].index.tolist()
+        n_keep = min(target, len(src_idx))
+        kept = rng.choice(src_idx, size=n_keep, replace=False)
         kept_ai_idx.extend(kept.tolist())
-        log.info(f"  {source}: {len(source_idx)} → {n_keep} chunks kept")
+        log.info(f"  {source}: {len(src_idx)} → {n_keep} kept")
 
-    # Rebuild: human rows + capped AI rows + all other splits untouched
-    other_splits = chunk_df[~mask_split]
-    human_rows = chunk_df[human_mask]
-    ai_kept = chunk_df.loc[kept_ai_idx]
+    other = chunk_df[~mask_split]
+    human = chunk_df[human_mask]
+    ai = chunk_df.loc[kept_ai_idx]
 
     result = (
-        pd.concat([other_splits, human_rows, ai_kept])
-        .sort_values("chunk_id")
-        .reset_index(drop=True)
+        pd.concat([other, human, ai]).sort_values("chunk_id").reset_index(drop=True)
     )
 
     log.info(
@@ -257,7 +204,7 @@ def cap_ai_chunks(
 
 def _log_chunk_summary(chunk_df: pd.DataFrame) -> None:
     log.info(f"\n{'=' * 55}")
-    log.info(f"Chunk index summary")
+    log.info("Chunk index summary")
     log.info(f"{'=' * 55}")
     summary = (
         chunk_df.groupby(["split", "label", "source_name"])
@@ -266,14 +213,14 @@ def _log_chunk_summary(chunk_df: pd.DataFrame) -> None:
         .reset_index()
     )
     log.info(f"\n{summary.to_string(index=False)}")
-
-    # Duration coverage stats
-    chunk_df = chunk_df.copy()
     log.info(f"\nTotal chunks : {len(chunk_df)}")
     log.info(f"Unique tracks: {chunk_df['file_path'].nunique()}")
-
-    per_track = chunk_df.groupby("file_path").size()
+    per_track = chunk_df.groupby(["split", "file_path"]).size()
     log.info(
-        f"Chunks/track : mean={per_track.mean():.1f} "
-        f"min={per_track.min()} max={per_track.max()}"
+        f"Chunks/track (train): "
+        f"mean={per_track['train'].mean():.1f} "
+        f"min={per_track['train'].min()} "
+        f"max={per_track['train'].max()}"
+        if "train" in per_track.index.get_level_values(0)
+        else ""
     )

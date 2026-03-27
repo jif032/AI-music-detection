@@ -10,36 +10,74 @@
 #     at both chunk level and track level
 #   - Full training history returned as DataFrame for plotting
 # =============================================================================
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau, LinearLR
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from dataclasses import dataclass, field, asdict
 import logging
 import time
-import json
+import platform
 
 log = logging.getLogger(__name__)
 
 
-def _compute_metrics(
-    all_labels: np.ndarray,
-    all_probs: np.ndarray,
-    all_track_ids: np.ndarray,
-    all_sources: list[str],
-    threshold: float = 0.5,
-) -> dict:
-    from evaluate import compute_chunk_metrics, compute_track_metrics
+# ── TrainingConfig ────────────────────────────────────────────────────────────
 
-    chunk_metrics = compute_chunk_metrics(all_labels, all_probs, threshold)
-    track_metrics = compute_track_metrics(
-        all_labels, all_probs, all_track_ids, threshold
-    )
-    return {"chunk": chunk_metrics, "track": track_metrics}
+
+@dataclass
+class TrainingConfig:
+    """
+    All training hyperparameters in one place.
+    Instantiate in the notebook and pass to train().
+    Stored inside every checkpoint for reproducibility.
+
+    scheduler_metric  : "val_loss" | "val_auroc" | "val_auprc"
+                        What the LR scheduler monitors.
+                        val_loss is recommended — smoother signal.
+    checkpoint_metric : "val_auroc" | "val_auprc"
+                        What triggers best-model saving and early stopping.
+                        val_auroc is recommended.
+    """
+
+    # Optimization
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-4
+    batch_size: int = 64
+    num_epochs: int = 30
+
+    # LR schedule
+    lr_patience: int = 5
+    lr_factor: float = 0.5
+    lr_min: float = 1e-6
+    warmup_epochs: int = 0
+
+    # Early stopping and checkpointing
+    early_stop_patience: int = 10
+    scheduler_metric: str = "val_loss"  # monitor loss for LR reduction
+    checkpoint_metric: str = "val_auroc"  # save best AUROC model
+
+    # Augmentation (passed through to dataset if needed)
+    use_augmentation: bool = True
+    freq_mask_param: int = 15
+    time_mask_param: int = 50
+    n_freq_masks: int = 2
+    n_time_masks: int = 2
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def log_summary(self) -> None:
+        log.info("Training config:")
+        for k, v in self.to_dict().items():
+            log.info(f"  {k:<25}: {v}")
+
+
+# ── Epoch runner ──────────────────────────────────────────────────────────────
 
 
 def _run_epoch(
@@ -48,10 +86,14 @@ def _run_epoch(
     criterion,
     optimizer,
     device,
-    is_train,
-    use_amp,
+    is_train: bool,
+    use_amp: bool,
     scaler,
 ) -> tuple:
+    """
+    Run one epoch — either training or evaluation.
+    Returns (avg_loss, labels, probs, track_ids, sources).
+    """
     model.train(is_train)
     total_loss = 0.0
     all_labels = []
@@ -59,29 +101,29 @@ def _run_epoch(
     all_track_ids = []
     all_sources = []
 
-    context = torch.enable_grad() if is_train else torch.no_grad()
+    ctx = torch.enable_grad() if is_train else torch.no_grad()
 
-    with context:
-        for batch_inputs, batch_labels, batch_metas in loader:
-            # Collect BEFORE device move
-            labels_np = batch_labels.numpy().tolist()
-            track_ids_np = [m["track_id"] for m in batch_metas]
-            sources_np = [m["source_name"] for m in batch_metas]
+    with ctx:
+        for b_in, b_lab, b_meta in loader:
+            # Collect labels BEFORE device move (MPS safety)
+            labels_np = b_lab.numpy().tolist()
+            tids_np = [m["track_id"] for m in b_meta]
+            srcs_np = [m["source_name"] for m in b_meta]
 
-            # Zero gradients BEFORE forward
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
 
-            batch_inputs = batch_inputs.to(device, non_blocking=True)
-            batch_labels = batch_labels.to(device, non_blocking=True)
+            # NOTE: no non_blocking=True — causes silent data corruption on MPS
+            b_in = b_in.to(device)
+            b_lab = b_lab.to(device)
 
             if use_amp and scaler is not None:
                 with torch.autocast(device_type=device.type):
-                    logits = model(batch_inputs)
-                    loss = criterion(logits, batch_labels)
+                    logits = model(b_in)
+                    loss = criterion(logits, b_lab)
             else:
-                logits = model(batch_inputs)
-                loss = criterion(logits, batch_labels)
+                logits = model(b_in)
+                loss = criterion(logits, b_lab)
 
             if is_train:
                 if scaler is not None:
@@ -95,13 +137,14 @@ def _run_epoch(
                     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
 
-            total_loss += loss.item() * batch_inputs.size(0)
+            total_loss += loss.item() * b_in.size(0)
 
             probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+
             all_probs.extend(probs.tolist())
             all_labels.extend(labels_np)
-            all_track_ids.extend(track_ids_np)
-            all_sources.extend(sources_np)
+            all_track_ids.extend(tids_np)
+            all_sources.extend(srcs_np)
 
     avg_loss = total_loss / len(loader.dataset)
     return (
@@ -113,14 +156,33 @@ def _run_epoch(
     )
 
 
+# ── Metric helpers ────────────────────────────────────────────────────────────
+
+
+def _compute_metrics(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    track_ids: np.ndarray,
+    sources: list,
+    threshold: float = 0.5,
+) -> dict:
+    from evaluate import compute_chunk_metrics, compute_track_metrics
+
+    return {
+        "chunk": compute_chunk_metrics(labels, probs, threshold),
+        "track": compute_track_metrics(labels, probs, track_ids, threshold),
+    }
+
+
 def _format_metrics(metrics: dict, prefix: str) -> str:
     c = metrics["chunk"]
     t = metrics["track"]
     return (
         f"{prefix} | "
-        f"chunk — acc={c['accuracy']:.4f} auroc={c['auroc']:.4f} "
+        f"chunk acc={c['accuracy']:.4f} "
+        f"auroc={c['auroc']:.4f} "
         f"auprc={c['auprc']:.4f} | "
-        f"track — acc={t['accuracy']:.4f} auroc={t['auroc']:.4f} "
+        f"track auroc={t['auroc']:.4f} "
         f"auprc={t['auprc']:.4f}"
     )
 
@@ -131,7 +193,7 @@ def _epoch_row(epoch, split, loss, metrics) -> dict:
     return {
         "epoch": epoch,
         "split": split,
-        "loss": loss,
+        "loss": round(loss, 6),
         "chunk_accuracy": c["accuracy"],
         "chunk_auroc": c["auroc"],
         "chunk_auprc": c["auprc"],
@@ -143,108 +205,174 @@ def _epoch_row(epoch, split, loss, metrics) -> dict:
     }
 
 
-def _save_checkpoint(model, optimizer, epoch, metrics, path, config):
+# ── Checkpoint helpers ────────────────────────────────────────────────────────
+
+
+def _save_checkpoint(
+    model,
+    optimizer,
+    epoch,
+    val_loss,
+    val_metrics,
+    path,
+    run_name,
+    train_cfg,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "epoch": epoch,
+            "run_name": run_name,
             "model_state": model.state_dict(),
             "optim_state": optimizer.state_dict(),
-            "val_auprc": metrics["chunk"]["auprc"],
-            "config": {
-                "model_type": config.MODEL_TYPE,
-                "n_mels": config.N_MELS,
-                "spec_shape": config.SPEC_SHAPE,
-                "cnn_channels": config.CNN_CHANNELS,
-            },
+            "val_loss": val_loss,
+            "val_auroc": val_metrics["chunk"]["auroc"],
+            "val_auprc": val_metrics["chunk"]["auprc"],
+            "train_config": train_cfg.to_dict(),
         },
         path,
     )
-    log.info(f"Checkpoint saved → {path}")
+    log.info(f"Checkpoint → {path}")
 
 
-def load_checkpoint(model, path, device, optimizer=None) -> dict:
+def load_checkpoint(
+    model,
+    path,
+    device,
+    optimizer=None,
+) -> dict:
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
     if optimizer is not None and "optim_state" in ckpt:
         optimizer.load_state_dict(ckpt["optim_state"])
     log.info(
-        f"Loaded checkpoint from {path} "
-        f"(epoch={ckpt['epoch']}, val_auprc={ckpt['val_auprc']:.4f})"
+        f"Loaded {path} | "
+        f"epoch={ckpt['epoch']} | "
+        f"val_auroc={ckpt.get('val_auroc', 'n/a'):.4f}"
     )
     return ckpt
 
 
+# ── Main training function ────────────────────────────────────────────────────
+
+
 def train(
     model: nn.Module,
-    loaders: dict[str, DataLoader],
-    config,
+    loaders: dict,
+    train_cfg: TrainingConfig,
+    base_config,
     device: torch.device,
     manifest: pd.DataFrame,
     run_name: str = "run",
+    model_type: str = "cnn",
 ) -> pd.DataFrame:
     """
     Full training loop.
 
     Parameters
     ----------
-    model    : instantiated model on device
-    loaders  : dict with keys "train", "val"
-    config   : config module
-    device   : torch device
-    manifest : full manifest DataFrame — used to build augment-free
-               train eval loader for honest metric computation
-    run_name : checkpoint / log filename prefix
-    """
-    from dataset import build_eval_loader
+    model       : instantiated model already on device
+    loaders     : dict with keys "train" and "val"
+                  Built externally in the notebook.
+                  loaders["train"] must have augmentation=True.
+                  loaders["val"]   must have augmentation=False.
+    train_cfg   : TrainingConfig dataclass
+    base_config : config module — paths, mel params
+    device      : torch device
+    manifest    : full manifest DataFrame — used to build augment-free
+                  train eval loader for honest metric computation
+    run_name    : checkpoint and log filename prefix
+    model_type  : "mlp" | "cnn" | "cnn_lstm" | "cnn_gru"
 
+    Returns
+    -------
+    history_df : DataFrame — one row per (epoch, split)
+    """
+    from dataset import MelSpecDataset, MelSpecSeqDataset, _collate_fn
+
+    # ── Augment-free train eval loader ────────────────────────────────────
+    # Built here — not passed in — so metrics are always on clean data.
+    mtype = model_type.lower()
+    if mtype in ("cnn_lstm", "cnn_gru"):
+        train_eval_ds = MelSpecSeqDataset(
+            manifest=manifest,
+            split="train",
+            config=base_config,
+            segment_frames=43,
+            augment=False,
+        )
+    else:
+        # covers "mlp", "cnn", and anything else using 2D spectrograms
+        train_eval_ds = MelSpecDataset(
+            manifest=manifest,
+            split="train",
+            config=base_config,
+            augment=False,
+        )
+
+    train_eval_loader = DataLoader(
+        train_eval_ds,
+        batch_size=train_cfg.batch_size,
+        shuffle=False,
+        num_workers=0 if platform.system() == "Darwin" else 4,
+        pin_memory=False,
+        drop_last=False,
+        collate_fn=_collate_fn,
+    )
+
+    # ── Optimizer ─────────────────────────────────────────────────────────
     criterion = nn.CrossEntropyLoss()
     optimizer = AdamW(
         model.parameters(),
-        lr=config.LEARNING_RATE,
-        weight_decay=config.WEIGHT_DECAY,
-    )
-    scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        patience=config.LR_PATIENCE,
-        factor=config.LR_FACTOR,
-        min_lr=config.LR_MIN,
+        lr=train_cfg.learning_rate,
+        weight_decay=train_cfg.weight_decay,
     )
 
+    # ── Warmup scheduler ──────────────────────────────────────────────────
+    use_warmup = train_cfg.warmup_epochs > 0
+    if use_warmup:
+        warmup = LinearLR(
+            optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=train_cfg.warmup_epochs,
+        )
+
+    # ── Plateau scheduler — mode depends on monitored metric ──────────────
+    plateau_mode = "min" if train_cfg.scheduler_metric == "val_loss" else "max"
+    plateau = ReduceLROnPlateau(
+        optimizer,
+        mode=plateau_mode,
+        patience=train_cfg.lr_patience,
+        factor=train_cfg.lr_factor,
+        min_lr=train_cfg.lr_min,
+    )
+
+    # ── AMP (CUDA only — MPS not supported) ───────────────────────────────
     use_amp = device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
-    # Augment-free loader for honest train metrics
-    train_eval_loader = build_eval_loader(
-        manifest=manifest,
-        config=config,
-        split="train",
-        model_type=config.MODEL_TYPE,
+    # ── State ─────────────────────────────────────────────────────────────
+    best_metric_value = (
+        float("inf") if train_cfg.checkpoint_metric == "val_loss" else -1.0
     )
-
-    best_val_auprc = -1.0
     epochs_no_improve = 0
     history = []
 
-    best_ckpt_path = config.CHECKPOINT_DIR / f"{run_name}_best.pt"
-    last_ckpt_path = config.CHECKPOINT_DIR / f"{run_name}_last.pt"
+    best_ckpt = base_config.CHECKPOINT_DIR / f"{run_name}_best.pt"
+    last_ckpt = base_config.CHECKPOINT_DIR / f"{run_name}_last.pt"
 
-    log.info(f"\n{'=' * 55}")
-    log.info(f"Training start — run='{run_name}'")
-    log.info(f"  Model     : {config.MODEL_TYPE}")
-    log.info(f"  Device    : {device}")
-    log.info(f"  Epochs    : {config.NUM_EPOCHS}")
-    log.info(f"  Batch     : {config.BATCH_SIZE}")
-    log.info(f"  LR        : {config.LEARNING_RATE}")
-    log.info(f"  AMP       : {use_amp}")
-    log.info(f"  Early stop: patience={config.EARLY_STOP_PATIENCE}")
-    log.info(f"{'=' * 55}\n")
+    log.info(f"\n{'=' * 60}")
+    log.info(f"Training  run='{run_name}'  device={device}  model={mtype}")
+    log.info(f"  scheduler → {train_cfg.scheduler_metric} (mode={plateau_mode})")
+    log.info(f"  checkpoint → best {train_cfg.checkpoint_metric}")
+    train_cfg.log_summary()
+    log.info(f"{'=' * 60}\n")
 
-    for epoch in range(1, config.NUM_EPOCHS + 1):
+    for epoch in range(1, train_cfg.num_epochs + 1):
         t0 = time.time()
 
-        # ── Weight update pass (with augmentation) ─────────────────────────
+        # ── Weight update pass (augmented train loader) ────────────────────
         _run_epoch(
             model,
             loaders["train"],
@@ -256,8 +384,8 @@ def train(
             scaler=scaler,
         )
 
-        # ── Train metrics (no augmentation — honest evaluation) ────────────
-        train_loss, tr_labels, tr_probs, tr_tids, tr_srcs = _run_epoch(
+        # ── Train metrics (augment-free) ───────────────────────────────────
+        train_loss, tr_l, tr_p, tr_t, tr_s = _run_epoch(
             model,
             train_eval_loader,
             criterion,
@@ -267,10 +395,10 @@ def train(
             use_amp=use_amp,
             scaler=None,
         )
-        train_metrics = _compute_metrics(tr_labels, tr_probs, tr_tids, tr_srcs)
+        train_metrics = _compute_metrics(tr_l, tr_p, tr_t, tr_s)
 
         # ── Val metrics ────────────────────────────────────────────────────
-        val_loss, val_labels, val_probs, val_tids, val_srcs = _run_epoch(
+        val_loss, vl_l, vl_p, vl_t, vl_s = _run_epoch(
             model,
             loaders["val"],
             criterion,
@@ -280,17 +408,32 @@ def train(
             use_amp=use_amp,
             scaler=None,
         )
-        val_metrics = _compute_metrics(val_labels, val_probs, val_tids, val_srcs)
+        val_metrics = _compute_metrics(vl_l, vl_p, vl_t, vl_s)
 
+        val_auroc = val_metrics["chunk"]["auroc"]
         val_auprc = val_metrics["chunk"]["auprc"]
         elapsed = time.time() - t0
 
-        scheduler.step(val_auprc)
+        # ── Scheduler step ─────────────────────────────────────────────────
+        if use_warmup and epoch <= train_cfg.warmup_epochs:
+            warmup.step()
+        else:
+            sched_value = {
+                "val_loss": val_loss,
+                "val_auroc": val_auroc,
+                "val_auprc": val_auprc,
+            }[train_cfg.scheduler_metric]
+            plateau.step(sched_value)
+
         current_lr = optimizer.param_groups[0]["lr"]
 
+        # ── Logging ────────────────────────────────────────────────────────
         log.info(
-            f"Epoch {epoch:03d}/{config.NUM_EPOCHS} "
-            f"[{elapsed:.1f}s | lr={current_lr:.2e}]"
+            f"Epoch {epoch:03d}/{train_cfg.num_epochs} "
+            f"[{elapsed:.1f}s | lr={current_lr:.2e}] | "
+            f"val_loss={val_loss:.4f} "
+            f"val_auroc={val_auroc:.4f} "
+            f"val_auprc={val_auprc:.4f}"
         )
         log.info(_format_metrics(train_metrics, "  TRAIN"))
         log.info(_format_metrics(val_metrics, "  VAL  "))
@@ -298,36 +441,74 @@ def train(
         history.append(_epoch_row(epoch, "train", train_loss, train_metrics))
         history.append(_epoch_row(epoch, "val", val_loss, val_metrics))
 
-        if val_auprc > best_val_auprc:
-            best_val_auprc = val_auprc
+        # ── Checkpoint / early stopping ────────────────────────────────────
+        ckpt_value = {
+            "val_loss": val_loss,
+            "val_auroc": val_auroc,
+            "val_auprc": val_auprc,
+        }[train_cfg.checkpoint_metric]
+
+        # For loss: lower is better. For AUROC/AUPRC: higher is better.
+        improved = (
+            ckpt_value < best_metric_value
+            if train_cfg.checkpoint_metric == "val_loss"
+            else ckpt_value > best_metric_value
+        )
+
+        if improved:
+            best_metric_value = ckpt_value
             epochs_no_improve = 0
             _save_checkpoint(
-                model, optimizer, epoch, val_metrics, best_ckpt_path, config
+                model,
+                optimizer,
+                epoch,
+                val_loss,
+                val_metrics,
+                best_ckpt,
+                run_name,
+                train_cfg,
             )
-            log.info(f"  ↑ New best val AUPRC: {best_val_auprc:.4f}")
+            log.info(
+                f"  ↑ New best {train_cfg.checkpoint_metric}="
+                f"{best_metric_value:.4f} "
+                f"(auroc={val_auroc:.4f} auprc={val_auprc:.4f})"
+            )
         else:
             epochs_no_improve += 1
             log.info(
-                f"  No improvement for "
-                f"{epochs_no_improve}/{config.EARLY_STOP_PATIENCE} "
-                f"epochs (best={best_val_auprc:.4f})"
+                f"  No improvement "
+                f"{epochs_no_improve}/{train_cfg.early_stop_patience} "
+                f"(best {train_cfg.checkpoint_metric}="
+                f"{best_metric_value:.4f})"
             )
 
-        _save_checkpoint(model, optimizer, epoch, val_metrics, last_ckpt_path, config)
+        _save_checkpoint(
+            model,
+            optimizer,
+            epoch,
+            val_loss,
+            val_metrics,
+            last_ckpt,
+            run_name,
+            train_cfg,
+        )
 
-        if epochs_no_improve >= config.EARLY_STOP_PATIENCE:
+        if epochs_no_improve >= train_cfg.early_stop_patience:
             log.info(
                 f"\nEarly stopping at epoch {epoch}. "
-                f"Best val AUPRC: {best_val_auprc:.4f}"
+                f"Best {train_cfg.checkpoint_metric}: "
+                f"{best_metric_value:.4f}"
             )
             break
 
+    # ── Save history ───────────────────────────────────────────────────────
     history_df = pd.DataFrame(history)
-    history_path = config.LOGS_DIR / f"{run_name}_history.csv"
+    history_path = base_config.LOGS_DIR / f"{run_name}_history.csv"
     history_df.to_csv(history_path, index=False)
-    log.info(f"\nTraining history saved → {history_path}")
-    log.info(f"\n{'=' * 55}")
-    log.info(f"Training complete — best val AUPRC: {best_val_auprc:.4f}")
-    log.info(f"Best checkpoint  → {best_ckpt_path}")
-    log.info(f"{'=' * 55}")
+
+    log.info(f"\nHistory  → {history_path}")
+    log.info(
+        f"Best {train_cfg.checkpoint_metric}: {best_metric_value:.4f} → {best_ckpt}"
+    )
+
     return history_df

@@ -1,454 +1,461 @@
 # =============================================================================
 # mert_mining.py
 # =============================================================================
-# MERT + KNN hard-negative mining for training chunks.
+# MERT-based hard negative mining — KNN neighbor fraction method.
 #
-# Pipeline:
-#   1. Extract MERT embeddings for all training chunks
-#   2. Run KNN in embedding space to find "confused" chunks
-#      (chunks whose K nearest neighbors contain >= threshold% opposite class)
-#   3. Replace HARD_NEGATIVE_FRACTION of training chunks with hard negatives,
-#      stratified by source to preserve Suno/Udio proportions
-#   4. Log detailed statistics at every stage
+# Hard negative identification:
+#   For each chunk, find its K nearest neighbors from ALL chunks (human+AI).
+#   A chunk is "hard" if the fraction of its neighbors from the opposite class
+#   exceeds neighbor_confusion_threshold.
+#   e.g. a human chunk whose 4 of 10 neighbors are AI → confusion = 0.40 → hard
 #
-# Only training chunks are processed. Val/test chunks are never touched.
+# Subset construction:
+#   1. Identify all hard human and hard AI chunks (sorted by confusion desc)
+#   2. Cap hard chunks at hard_negative_fraction * target_n
+#      removing least-hard chunks if needed
+#   3. Fill remainder to target_n with random sampling
+#      balancing the full subset to 50/50 human/AI overall
 # =============================================================================
 
 import numpy as np
 import pandas as pd
 import torch
-import librosa
-import soundfile as sf
-from pathlib import Path
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import StandardScaler
 import logging
-import time
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 
-# ── Audio utilities ───────────────────────────────────────────────────────────
-
-
-def _rms_normalize(audio: np.ndarray, target_rms: float = 0.1) -> np.ndarray:
-    rms = np.sqrt(np.mean(audio**2))
-    if rms < 1e-8:
-        return audio
-    return audio * (target_rms / rms)
-
-
-def _load_chunk_for_mert(
-    file_path: str,
-    start_sec: float,
-    chunk_sec: float,
-    mert_sr: int,
-    rms_target: float,
-) -> np.ndarray:
-    """
-    Load one chunk from a wav file, resample to MERT SR, RMS normalize.
-    Pads with zeros if the loaded audio is shorter than expected.
-    """
-    expected_samples = int(chunk_sec * mert_sr)
-
-    audio, _ = librosa.load(
-        file_path,
-        sr=mert_sr,
-        mono=True,
-        offset=start_sec,
-        duration=chunk_sec,
-    )
-    audio = _rms_normalize(audio, rms_target)
-
-    if len(audio) < expected_samples:
-        audio = np.pad(audio, (0, expected_samples - len(audio)))
-
-    return audio[:expected_samples]
-
-
 # ── MERT embedding extraction ─────────────────────────────────────────────────
-
-
-def _load_mert(config, device: torch.device):
-    """Load MERT model and processor. Returns (model, processor)."""
-    from transformers import AutoModel, AutoProcessor
-
-    log.info(f"Loading MERT from {config.MERT_MODEL}...")
-    processor = AutoProcessor.from_pretrained(config.MERT_MODEL, trust_remote_code=True)
-    model = AutoModel.from_pretrained(config.MERT_MODEL, trust_remote_code=True)
-    model = model.to(device)
-    model.eval()
-    log.info("MERT loaded successfully.")
-    return model, processor
-
-
-def _extract_embedding(
-    audio: np.ndarray,
-    model,
-    processor,
-    device: torch.device,
-    layer: int,
-    mert_sr: int,
-) -> np.ndarray:
-    """Extract mean-pooled embedding from a specific MERT layer."""
-    inputs = processor(
-        audio,
-        sampling_rate=mert_sr,
-        return_tensors="pt",
-        padding=True,
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        outputs = model(**inputs, output_hidden_states=True)
-
-    hidden = outputs.hidden_states[layer]  # (1, time, 768)
-    return hidden.mean(dim=1).squeeze(0).cpu().numpy()  # (768,)
 
 
 def extract_mert_embeddings(
     chunk_df: pd.DataFrame,
     config,
     device: torch.device,
-    log_every: int = 200,
+    cache_path: Path | None = None,
 ) -> np.ndarray:
     """
-    Extract MERT embeddings for every chunk in chunk_df.
-
-    Parameters
-    ----------
-    chunk_df  : chunk index (any split — caller decides what to pass)
-    config    : config module
-    device    : torch device
-    log_every : log progress every N chunks
+    Extract MERT embeddings for all chunks in chunk_df.
+    Loads from cache if it exists and chunk count matches.
 
     Returns
     -------
-    embeddings : np.ndarray of shape (len(chunk_df), 768)
+    embeddings : (N, 768) float32 array
     """
-    model, processor = _load_mert(config, device)
-
-    n = len(chunk_df)
-    emb_dim = 768
-    embeddings = np.zeros((n, emb_dim), dtype=np.float32)
-
-    log.info(
-        f"Extracting MERT (layer {config.MERT_LAYER}) embeddings for {n} chunks..."
-    )
-    t0 = time.time()
-
-    for i, (_, row) in enumerate(chunk_df.iterrows()):
-        audio = _load_chunk_for_mert(
-            file_path=row["file_path"],
-            start_sec=row["start_sec"],
-            chunk_sec=config.CHUNK_SEC,
-            mert_sr=config.MERT_SR,
-            rms_target=config.RMS_TARGET,
-        )
-        embeddings[i] = _extract_embedding(
-            audio=audio,
-            model=model,
-            processor=processor,
-            device=device,
-            layer=config.MERT_LAYER,
-            mert_sr=config.MERT_SR,
-        )
-
-        if (i + 1) % log_every == 0:
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed
-            remaining = (n - i - 1) / rate
+    if cache_path is not None and Path(cache_path).exists():
+        cached = np.load(cache_path)
+        if cached.shape[0] == len(chunk_df):
             log.info(
-                f"  {i + 1}/{n} chunks | "
-                f"{elapsed:.0f}s elapsed | "
-                f"~{remaining:.0f}s remaining"
+                f"Loaded cached embeddings: {cache_path} ({cached.shape[0]} chunks)"
             )
+            return cached
+        log.warning(
+            f"Cache shape mismatch ({cached.shape[0]} vs "
+            f"{len(chunk_df)}) — recomputing."
+        )
 
-    log.info(f"Embedding extraction complete — {time.time() - t0:.1f}s total")
+    log.info(f"Extracting MERT embeddings for {len(chunk_df)} chunks...")
+    log.info(f"  Model : {config.MERT_MODEL}")
+    log.info(f"  Layer : {config.MERT_LAYER}")
+    log.info(f"  SR    : {config.MERT_SR}")
+
+    try:
+        from transformers import AutoModel, AutoProcessor
+    except ImportError:
+        raise ImportError(
+            "transformers not installed. "
+            "Run: pip install transformers --break-system-packages"
+        )
+
+    import librosa
+    import time
+
+    model = AutoModel.from_pretrained(config.MERT_MODEL, trust_remote_code=True).to(
+        device
+    )
+    processor = AutoProcessor.from_pretrained(config.MERT_MODEL, trust_remote_code=True)
+    model.eval()
+
+    embeddings = []
+    n_chunks = len(chunk_df)
+    start_time = time.time()
+
+    with torch.no_grad():
+        for i, (_, row) in enumerate(chunk_df.iterrows()):
+            if i % 500 == 0:
+                if i > 0:
+                    elapsed = time.time() - start_time
+                    per_chunk = elapsed / i
+                    remaining = (n_chunks - i) * per_chunk
+                    hrs = int(remaining // 3600)
+                    mins = int((remaining % 3600) // 60)
+                    log.info(
+                        f"  [{i}/{n_chunks}] "
+                        f"{per_chunk:.2f}s/chunk | "
+                        f"ETA: {hrs}h {mins}m"
+                    )
+                else:
+                    log.info(f"  [{i}/{n_chunks}] starting...")
+
+            try:
+                audio, _ = librosa.load(
+                    row["file_path"],
+                    sr=config.MERT_SR,
+                    mono=True,
+                    offset=float(row["start_sec"]),
+                    duration=config.CHUNK_SEC,
+                )
+            except Exception as e:
+                log.warning(f"  Failed: {row['file_path']} — {e}")
+                embeddings.append(np.zeros(768, dtype=np.float32))
+                continue
+
+            inputs = processor(
+                audio,
+                sampling_rate=config.MERT_SR,
+                return_tensors="pt",
+            ).to(device)
+            outputs = model(**inputs, output_hidden_states=True)
+            hidden = outputs.hidden_states[config.MERT_LAYER]
+            emb = hidden.mean(dim=1).squeeze().cpu().numpy()
+            embeddings.append(emb.astype(np.float32))
+
+    embeddings = np.stack(embeddings)
+
+    if cache_path is not None:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_path, embeddings)
+        log.info(f"Embeddings cached → {cache_path}")
+
     return embeddings
 
 
-# ── KNN confusion scoring ─────────────────────────────────────────────────────
+# ── Cosine similarity ─────────────────────────────────────────────────────────
 
 
-def compute_confusion_scores(
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Cosine similarity between each row of a and each row of b."""
+    a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
+    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-8)
+    return a_norm @ b_norm.T
+
+
+# ── KNN neighbor fraction scoring ─────────────────────────────────────────────
+
+
+def score_knn_confusion(
     embeddings: np.ndarray,
     labels: np.ndarray,
-    k: int,
+    k: int = 10,
 ) -> np.ndarray:
     """
-    For each chunk, compute its confusion score:
-      fraction of K nearest neighbors (excluding self) from the opposite class.
+    For each chunk, find its K nearest neighbors from ALL chunks (human+AI
+    combined, excluding itself), and compute the fraction of neighbors
+    from the opposite class.
+
+    A human chunk with many AI neighbors is hard (looks like AI).
+    An AI chunk with many human neighbors is hard (looks like human).
 
     Parameters
     ----------
-    embeddings : (N, D) float32
-    labels     : (N,) int — 0=human, 1=ai
-    k          : number of neighbors
+    embeddings : (N, 768)
+    labels     : (N,) — 0=human, 1=ai
+    k          : number of nearest neighbors
 
     Returns
     -------
-    confusion_scores : (N,) float — values in [0, 1]
+    confusion_fracs : (N,) — fraction of K neighbors from opposite class
     """
-    log.info(f"Running KNN (k={k}) on {len(embeddings)} embeddings...")
-    t0 = time.time()
+    n = len(embeddings)
+    log.info(f"Computing KNN confusion fractions (k={k}, N={n})...")
 
-    # Normalize before KNN so cosine ~ euclidean distance
-    scaler = StandardScaler()
-    embs_normed = scaler.fit_transform(embeddings)
+    # Full similarity matrix (N, N)
+    sim_matrix = _cosine_sim(embeddings, embeddings)
 
-    # k+1 because the first neighbor is always the point itself
-    knn = NearestNeighbors(
-        n_neighbors=k + 1,
-        metric="cosine",
-        n_jobs=-1,
+    # Set self-similarity to -inf so each chunk doesn't neighbor itself
+    np.fill_diagonal(sim_matrix, -np.inf)
+
+    # For each chunk: indices of K nearest neighbors
+    # argsort ascending → take last K for highest similarity
+    top_k_indices = np.argsort(sim_matrix, axis=1)[:, -k:]  # (N, K)
+
+    # For each chunk: labels of its K neighbors
+    neighbor_labels = labels[top_k_indices]  # (N, K)
+
+    # Fraction of neighbors from the opposite class
+    opposite_class = 1 - labels  # flip: human→1, ai→0
+    # For human (label=0): opposite=1=AI, count AI neighbors
+    # For AI    (label=1): opposite=0=human, count human neighbors
+    confusion_fracs = np.array(
+        [(neighbor_labels[i] == opposite_class[i]).mean() for i in range(n)],
+        dtype=np.float32,
     )
-    knn.fit(embs_normed)
-    _, indices = knn.kneighbors(embs_normed)
 
-    # Exclude self (index 0) and compute opposite-class fraction
-    confusion_scores = np.zeros(len(embeddings), dtype=np.float32)
-    for i, neighbor_idx in enumerate(indices):
-        neighbor_idx = neighbor_idx[1:]  # exclude self
-        neighbor_labels = labels[neighbor_idx]
-        opposite = (neighbor_labels != labels[i]).sum()
-        confusion_scores[i] = opposite / k
-
-    log.info(f"KNN complete — {time.time() - t0:.1f}s")
-    log.info(f"Confusion score stats:")
-    log.info(f"  mean   = {confusion_scores.mean():.4f}")
-    log.info(f"  median = {np.median(confusion_scores):.4f}")
-    log.info(f"  >0.30  = {(confusion_scores >= 0.30).sum()} chunks")
-    log.info(f"  >0.50  = {(confusion_scores >= 0.50).sum()} chunks")
-
-    return confusion_scores
-
-
-# ── Hard-negative selection ───────────────────────────────────────────────────
-
-
-def _log_mining_stats(
-    chunk_df: pd.DataFrame,
-    confusion_scores: np.ndarray,
-    hard_negative_mask: np.ndarray,
-    config,
-) -> None:
-    """Log detailed per-source confusion statistics."""
-    df = chunk_df.copy()
-    df["confusion_score"] = confusion_scores
-    df["is_hard_negative"] = hard_negative_mask
-
-    log.info(f"\n{'=' * 55}")
-    log.info("Hard-negative mining statistics")
-    log.info(f"{'=' * 55}")
-
-    for source in df["source_name"].unique():
-        sub = df[df["source_name"] == source]
-        hn = sub["is_hard_negative"].sum()
-        log.info(
-            f"  {source:8s} | total={len(sub):5d} | "
-            f"confused (≥{config.KNN_CONFUSION_THRESHOLD:.0%})="
-            f"{(sub['confusion_score'] >= config.KNN_CONFUSION_THRESHOLD).sum():5d} | "
-            f"selected as HN={hn:5d} | "
-            f"unique tracks={sub[sub['is_hard_negative']]['file_path'].nunique()}"
-        )
-
-    total_hn = hard_negative_mask.sum()
-    log.info(f"\n  Total hard negatives selected : {total_hn}")
-    log.info(f"  Fraction of training set      : {total_hn / len(chunk_df):.2%}")
-
-
-def select_hard_negatives(
-    chunk_df: pd.DataFrame,
-    confusion_scores: np.ndarray,
-    config,
-) -> pd.DataFrame:
-    """
-    Replace HARD_NEGATIVE_FRACTION of training chunks with hard negatives.
-
-    Strategy:
-      - A chunk qualifies as a hard negative if its confusion score
-        >= KNN_CONFUSION_THRESHOLD.
-      - We replace ceil(HARD_NEGATIVE_FRACTION * N_train) random chunks
-        with qualified hard negatives, stratified by source.
-      - If fewer hard negatives exist than needed, we use all available
-        and log a warning.
-      - No chunk appears twice in the final index.
-
-    Parameters
-    ----------
-    chunk_df         : training chunks only (split == "train")
-    confusion_scores : (len(chunk_df),) — output of compute_confusion_scores
-    config           : config module
-
-    Returns
-    -------
-    Updated chunk DataFrame where ~HARD_NEGATIVE_FRACTION of rows
-    are hard negatives and the rest are randomly sampled easy examples.
-    """
-    rng = np.random.default_rng(config.SEED)
-
-    df = chunk_df.copy().reset_index(drop=True)
-    df["confusion_score"] = confusion_scores
-
-    n_total = len(df)
-    n_hard = int(np.ceil(n_total * config.HARD_NEGATIVE_FRACTION))
-    n_easy = n_total - n_hard
-
-    log.info(f"\nSelecting hard negatives...")
-    log.info(f"  Total train chunks : {n_total}")
-    log.info(f"  Target hard        : {n_hard} ({config.HARD_NEGATIVE_FRACTION:.0%})")
-    log.info(f"  Target easy        : {n_easy}")
-
-    # Identify qualified hard negatives
-    qualified_mask = confusion_scores >= config.KNN_CONFUSION_THRESHOLD
-    qualified_df = df[qualified_mask].copy()
-
+    # Log summary
+    human_mask = labels == 0
+    ai_mask = labels == 1
     log.info(
-        f"  Qualified (score ≥ {config.KNN_CONFUSION_THRESHOLD:.0%}): "
-        f"{len(qualified_df)}"
+        f"  Human confusion fracs — "
+        f"mean={confusion_fracs[human_mask].mean():.3f} "
+        f"median={np.median(confusion_fracs[human_mask]):.3f} "
+        f"max={confusion_fracs[human_mask].max():.3f}"
     )
-
-    if len(qualified_df) < n_hard:
-        log.warning(
-            f"Only {len(qualified_df)} qualified hard negatives available "
-            f"(need {n_hard}). Using all qualified chunks."
-        )
-        n_hard = len(qualified_df)
-        n_easy = n_total - n_hard
-
-    # Stratified hard-negative selection (preserve source proportions)
-    source_counts = qualified_df["source_name"].value_counts()
-    source_fracs = source_counts / source_counts.sum()
-    target_hn_per_source = (source_fracs * n_hard).round().astype(int)
-
-    # Fix rounding
-    diff = n_hard - target_hn_per_source.sum()
-    if diff != 0:
-        target_hn_per_source[target_hn_per_source.idxmax()] += diff
-
-    selected_hn_idx = []
-    for source, target in target_hn_per_source.items():
-        pool = qualified_df[qualified_df["source_name"] == source].index.tolist()
-        n_pick = min(target, len(pool))
-        chosen = rng.choice(pool, size=n_pick, replace=False).tolist()
-        selected_hn_idx.extend(chosen)
-        log.info(f"  Hard neg | {source:8s}: {n_pick} selected")
-
-    # Easy chunks = everything not selected as hard negative
-    all_idx = set(df.index.tolist())
-    hn_idx_set = set(selected_hn_idx)
-    easy_pool = list(all_idx - hn_idx_set)
-
-    selected_easy_idx = rng.choice(
-        easy_pool,
-        size=min(n_easy, len(easy_pool)),
-        replace=False,
-    ).tolist()
-
-    # Build hard_negative_mask for logging
-    hard_negative_mask = np.zeros(len(df), dtype=bool)
-    hard_negative_mask[selected_hn_idx] = True
-
-    _log_mining_stats(df, confusion_scores, hard_negative_mask, config)
-
-    # Combine and tag
-    final_idx = selected_hn_idx + selected_easy_idx
-    result = df.loc[final_idx].copy()
-    result["is_hard_negative"] = result.index.isin(hn_idx_set)
-    result = result.reset_index(drop=True)
-    result["chunk_id"] = range(len(result))
-
-    log.info(f"\nFinal training set:")
     log.info(
-        result.groupby(["label", "source_name", "is_hard_negative"])
-        .size()
-        .rename("chunks")
-        .to_string()
+        f"  AI    confusion fracs — "
+        f"mean={confusion_fracs[ai_mask].mean():.3f} "
+        f"median={np.median(confusion_fracs[ai_mask]):.3f} "
+        f"max={confusion_fracs[ai_mask].max():.3f}"
     )
-    log.info(f"Unique tracks: {result['file_path'].nunique()}")
 
-    return result
-
-
-# ── Public entry point ────────────────────────────────────────────────────────
+    return confusion_fracs
 
 
-def run_hard_negative_mining(
+# ── Main function ─────────────────────────────────────────────────────────────
+
+
+def build_mined_chunk_index(
     chunk_df: pd.DataFrame,
     config,
     device: torch.device,
+    subset_fraction: float = 0.25,
+    hard_negative_fraction: float = 0.30,
+    neighbor_confusion_threshold: float = 0.30,
+    knn_k: int = 10,
     embeddings_cache_path: Path | None = None,
+    random_seed: int = 42,
 ) -> pd.DataFrame:
     """
-    Full hard-negative mining pipeline for training chunks.
+    Build a mined training subset using KNN neighbor fraction scoring.
 
     Parameters
     ----------
-    chunk_df              : full chunk index (all splits)
-    config                : config module
-    device                : torch device
-    embeddings_cache_path : if given, save/load embeddings from this .npy path
-                            to avoid re-extracting on reruns
+    chunk_df                     : full chunk DataFrame (all splits)
+    config                       : config module
+    device                       : torch device for MERT
+    subset_fraction              : target train size as fraction of full train
+                                   e.g. 0.25 → target_n = 25% of train chunks
+    hard_negative_fraction       : max fraction of target_n that are hard chunks
+                                   e.g. 0.30 → at most 30% hard, 70% random
+    neighbor_confusion_threshold : min fraction of opposite-class neighbors
+                                   to qualify as a hard chunk
+                                   e.g. 0.30 → need ≥3 of 10 neighbors
+                                   from opposite class
+    knn_k                        : number of nearest neighbors
+    embeddings_cache_path        : path to cache/load MERT embeddings
+    random_seed                  : reproducibility
 
     Returns
     -------
-    Full chunk_df with training chunks replaced by hard-negative-mined version.
-    Val/test chunks are returned unchanged.
+    result_df : chunk DataFrame — train split replaced by mined subset
+                val/test unchanged
+                columns added:
+                  hard_type        : "hard_human" | "hard_ai" | "random"
+                  confusion_frac   : fraction of opposite-class neighbors
+                  is_hard_negative : bool (backwards compat)
     """
-    # Separate train from val/test — never touch val/test
-    train_mask = chunk_df["split"] == "train"
-    train_chunks = chunk_df[train_mask].copy().reset_index(drop=True)
-    other_chunks = chunk_df[~train_mask].copy()
+    rng = np.random.default_rng(random_seed)
 
+    # ── Separate train from val/test ──────────────────────────────────────
+    train_mask = chunk_df["split"] == "train"
+    train_df = chunk_df[train_mask].reset_index(drop=True)
+    other_df = chunk_df[~train_mask].copy()
+
+    n_train = len(train_df)
+    target_n = int(n_train * subset_fraction)
+    max_hard = int(target_n * hard_negative_fraction)
+    n_random = target_n - max_hard  # at least this many random chunks
+
+    labels = (train_df["label"].astype(str) == "ai").astype(int).values
+    human_mask = labels == 0
+    ai_mask = labels == 1
+
+    log.info(f"\n{'=' * 60}")
+    log.info(f"MERT KNN hard negative mining")
+    log.info(f"  Full train set              : {n_train}")
     log.info(
-        f"Hard-negative mining on {len(train_chunks)} training chunks "
-        f"({other_chunks['split'].value_counts().to_dict()} unchanged)"
+        f"  Target subset               : {target_n} ({subset_fraction * 100:.0f}%)"
+    )
+    log.info(
+        f"  Max hard chunks             : {max_hard} "
+        f"({hard_negative_fraction * 100:.0f}% of target)"
+    )
+    log.info(
+        f"  Min random fill             : {n_random} "
+        f"({(1 - hard_negative_fraction) * 100:.0f}% of target)"
+    )
+    log.info(
+        f"  Neighbor confusion threshold: "
+        f"{neighbor_confusion_threshold:.2f} "
+        f"(≥{int(neighbor_confusion_threshold * knn_k)} of {knn_k} "
+        f"neighbors from opposite class)"
+    )
+    log.info(f"{'=' * 60}")
+
+    # ── Load embeddings ───────────────────────────────────────────────────
+    embeddings = extract_mert_embeddings(
+        chunk_df=train_df,
+        config=config,
+        device=device,
+        cache_path=embeddings_cache_path,
     )
 
-    # ── Step 1: Extract or load embeddings ───────────────────────────────
-    if embeddings_cache_path is not None and embeddings_cache_path.exists():
-        log.info(f"Loading cached embeddings from {embeddings_cache_path}")
-        embeddings = np.load(embeddings_cache_path)
-        assert len(embeddings) == len(train_chunks), (
-            f"Cached embeddings length {len(embeddings)} != "
-            f"train chunks {len(train_chunks)} — delete cache and rerun."
-        )
-    else:
-        embeddings = extract_mert_embeddings(train_chunks, config, device)
-        if embeddings_cache_path is not None:
-            embeddings_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.save(embeddings_cache_path, embeddings)
-            log.info(f"Embeddings cached → {embeddings_cache_path}")
-
-    # ── Step 2: KNN confusion scoring ─────────────────────────────────────
-    labels = (train_chunks["label"] == "ai").astype(int).values
-    confusion_scores = compute_confusion_scores(
+    # ── Score KNN confusion for all training chunks ────────────────────────
+    confusion_fracs = score_knn_confusion(
         embeddings=embeddings,
         labels=labels,
-        k=config.KNN_K,
+        k=knn_k,
     )
 
-    # ── Step 3: Select hard negatives ─────────────────────────────────────
-    mined_train = select_hard_negatives(
-        chunk_df=train_chunks,
-        confusion_scores=confusion_scores,
-        config=config,
+    # ── Identify hard chunks above threshold ──────────────────────────────
+    # Hard human: human chunks with ≥ threshold fraction of AI neighbors
+    hard_human_mask = human_mask & (confusion_fracs >= neighbor_confusion_threshold)
+    # Hard AI: AI chunks with ≥ threshold fraction of human neighbors
+    hard_ai_mask = ai_mask & (confusion_fracs >= neighbor_confusion_threshold)
+
+    hard_human_idx = np.where(hard_human_mask)[0]
+    hard_ai_idx = np.where(hard_ai_mask)[0]
+
+    log.info(
+        f"\nHard chunks identified (threshold={neighbor_confusion_threshold:.2f}):"
+    )
+    log.info(
+        f"  Hard human: {len(hard_human_idx):,} / "
+        f"{human_mask.sum():,} "
+        f"({100 * len(hard_human_idx) / human_mask.sum():.1f}%)"
+    )
+    log.info(
+        f"  Hard AI   : {len(hard_ai_idx):,} / "
+        f"{ai_mask.sum():,} "
+        f"({100 * len(hard_ai_idx) / ai_mask.sum():.1f}%)"
     )
 
-    # ── Step 4: Recombine with val/test ───────────────────────────────────
-    result = (
-        pd.concat([mined_train, other_chunks])
-        .sort_values(["split", "chunk_id"])
+    # ── Sort by confusion fraction descending (most confused first) ────────
+    hard_human_idx = hard_human_idx[np.argsort(confusion_fracs[hard_human_idx])[::-1]]
+    hard_ai_idx = hard_ai_idx[np.argsort(confusion_fracs[hard_ai_idx])[::-1]]
+
+    # ── Cap hard chunks at max_hard total, split evenly between classes ────
+    # Split budget evenly; if one class has fewer than budget, give
+    # the remainder to the other class
+    half_budget = max_hard // 2
+    n_hard_human = min(len(hard_human_idx), half_budget)
+    n_hard_ai = min(len(hard_ai_idx), half_budget)
+
+    # If one side is short, give unused budget to the other
+    shortfall_h = half_budget - n_hard_human
+    shortfall_a = half_budget - n_hard_ai
+    n_hard_ai = min(len(hard_ai_idx), half_budget + shortfall_h)
+    n_hard_human = min(len(hard_human_idx), half_budget + shortfall_a)
+
+    # Take only the top-N most confused chunks
+    selected_hard_human = hard_human_idx[:n_hard_human]
+    selected_hard_ai = hard_ai_idx[:n_hard_ai]
+    n_hard_actual = n_hard_human + n_hard_ai
+    n_random_needed = target_n - n_hard_actual
+
+    log.info(f"\nAfter capping at {max_hard} hard chunks:")
+    log.info(
+        f"  Selected hard human : {n_hard_human} "
+        f"(min confusion: "
+        f"{confusion_fracs[selected_hard_human].min():.3f})"
+    )
+    log.info(
+        f"  Selected hard AI    : {n_hard_ai} "
+        f"(min confusion: "
+        f"{confusion_fracs[selected_hard_ai].min():.3f})"
+    )
+    log.info(f"  Random fill needed  : {n_random_needed}")
+
+    # ── Random fill — balance full subset to 50/50 human/AI ───────────────
+    hard_set = set(selected_hard_human.tolist()) | set(selected_hard_ai.tolist())
+
+    # Count how many human and AI are already in hard set
+    n_hard_human_selected = n_hard_human
+    n_hard_ai_selected = n_hard_ai
+
+    # Target: 50/50 overall → target_n/2 of each class
+    target_human = target_n // 2
+    target_ai = target_n - target_human
+
+    n_random_human = max(0, target_human - n_hard_human_selected)
+    n_random_ai = max(0, target_ai - n_hard_ai_selected)
+
+    # Pool: all training chunks excluding already-selected hard chunks
+    remaining_human = np.array(
+        [i for i in np.where(human_mask)[0] if i not in hard_set]
+    )
+    remaining_ai = np.array([i for i in np.where(ai_mask)[0] if i not in hard_set])
+
+    # Clip if pool smaller than needed
+    n_random_human = min(n_random_human, len(remaining_human))
+    n_random_ai = min(n_random_ai, len(remaining_ai))
+
+    random_human_idx = rng.choice(remaining_human, size=n_random_human, replace=False)
+    random_ai_idx = rng.choice(remaining_ai, size=n_random_ai, replace=False)
+
+    log.info(f"\nRandom fill (balancing to 50/50):")
+    log.info(f"  Random human: {n_random_human} (from pool of {len(remaining_human)})")
+    log.info(f"  Random AI   : {n_random_ai} (from pool of {len(remaining_ai)})")
+
+    # ── Build DataFrames ──────────────────────────────────────────────────
+    def _make_subset(indices, hard_type):
+        df = train_df.iloc[indices].copy()
+        df["hard_type"] = hard_type
+        df["confusion_frac"] = confusion_fracs[indices]
+        df["is_hard_negative"] = hard_type != "random"
+        return df
+
+    hard_human_df = _make_subset(selected_hard_human, "hard_human")
+    hard_ai_df = _make_subset(selected_hard_ai, "hard_ai")
+    random_h_df = _make_subset(random_human_idx, "random")
+    random_a_df = _make_subset(random_ai_idx, "random")
+
+    mined_train_df = (
+        pd.concat(
+            [hard_human_df, hard_ai_df, random_h_df, random_a_df],
+            ignore_index=True,
+        )
+        .sample(frac=1, random_state=random_seed)
         .reset_index(drop=True)
     )
 
-    log.info(f"\nFinal chunk index after mining:")
+    # ── Summary ───────────────────────────────────────────────────────────
+    final_human = (mined_train_df["label"].astype(str) == "human").sum()
+    final_ai = (mined_train_df["label"].astype(str) == "ai").sum()
+
+    log.info(f"\n{'=' * 60}")
+    log.info(f"Final mined subset:")
+    log.info(f"  Total chunks  : {len(mined_train_df)}")
     log.info(
-        result.groupby(["split", "label", "source_name"])
+        f"  Human         : {final_human} "
+        f"({100 * final_human / len(mined_train_df):.1f}%)"
+    )
+    log.info(
+        f"  AI            : {final_ai} ({100 * final_ai / len(mined_train_df):.1f}%)"
+    )
+    log.info(f"  Hard human    : {(mined_train_df['hard_type'] == 'hard_human').sum()}")
+    log.info(f"  Hard AI       : {(mined_train_df['hard_type'] == 'hard_ai').sum()}")
+    log.info(f"  Random        : {(mined_train_df['hard_type'] == 'random').sum()}")
+    log.info(f"\nConfusion frac stats (hard chunks only):")
+    hard_only = mined_train_df[mined_train_df["is_hard_negative"]]
+    log.info(
+        f"  min={hard_only['confusion_frac'].min():.3f} "
+        f"mean={hard_only['confusion_frac'].mean():.3f} "
+        f"max={hard_only['confusion_frac'].max():.3f}"
+    )
+    log.info(f"{'=' * 60}")
+
+    print("\nLabel × source × hard_type breakdown:")
+    print(
+        mined_train_df.groupby(["label", "source_name", "hard_type"])
         .size()
         .rename("chunks")
         .to_string()
     )
 
-    return result
+    # ── Combine with val/test ─────────────────────────────────────────────
+    other_df["hard_type"] = "random"
+    other_df["confusion_frac"] = 0.0
+    other_df["is_hard_negative"] = False
+
+    return pd.concat([mined_train_df, other_df], ignore_index=True)
