@@ -91,6 +91,7 @@ To access datasets from Hugging Face:
 ## 🔄 Data Pipeline
 Running the notebooks will automatically generate the following structure:
 
+```
 music_data/
   ├── *.wav
   └── metadata_usable.csv
@@ -102,7 +103,7 @@ data/
   ├── checkpoints/     # Model weights
   ├── results/         # JSON metrics
   └── logs/            # Plots, confusion matrices, attribution maps
-
+```
 
 ## 🧠 Experimental Results
 I evaluated four architectures on a 6,000-chunk subset to quickly identify the most promising approach:
