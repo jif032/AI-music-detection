@@ -39,15 +39,20 @@ def spec_augment(
     time_mask_param: int,
     n_freq_masks: int,
     n_time_masks: int,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     n_mels, n_frames = spec.shape
     for _ in range(n_freq_masks):
-        f = torch.randint(0, freq_mask_param + 1, (1,)).item()
-        f_start = torch.randint(0, max(1, n_mels - f), (1,)).item()
+        f = torch.randint(0, freq_mask_param + 1, (1,), generator=generator).item()
+        f_start = torch.randint(
+            0, max(1, n_mels - f), (1,), generator=generator
+        ).item()
         spec[f_start : f_start + f, :] = 0.0
     for _ in range(n_time_masks):
-        t = torch.randint(0, time_mask_param + 1, (1,)).item()
-        t_start = torch.randint(0, max(1, n_frames - t), (1,)).item()
+        t = torch.randint(0, time_mask_param + 1, (1,), generator=generator).item()
+        t_start = torch.randint(
+            0, max(1, n_frames - t), (1,), generator=generator
+        ).item()
         spec[:, t_start : t_start + t] = 0.0
     return spec
 
@@ -75,6 +80,8 @@ class _BaseDataset(Dataset):
         self.split = split
         self.is_train = split == "train"
         self.augment = self.is_train if augment is None else augment
+        self.augmentation_seed = _get(config, "AUGMENTATION_SEED", None)
+        self.epoch = 0
 
         self.df = manifest[manifest["split"] == split].reset_index(drop=True)
         if len(self.df) == 0:
@@ -118,7 +125,11 @@ class _BaseDataset(Dataset):
     def _load_spec(self, idx: int) -> np.ndarray:
         return np.load(self.df.iloc[idx]["npy_path"]).astype(np.float32)
 
-    def _maybe_augment(self, spec: torch.Tensor) -> torch.Tensor:
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch used by seeded per-sample SpecAugment."""
+        self.epoch = int(epoch)
+
+    def _maybe_augment(self, spec: torch.Tensor, idx: int) -> torch.Tensor:
         """Apply SpecAugment only when self.augment is True AND config has params."""
         if not self.augment:
             return spec
@@ -126,12 +137,19 @@ class _BaseDataset(Dataset):
         use_aug = _get(self.config, "USE_AUGMENTATION", False)
         if not use_aug:
             return spec
+        generator = None
+        if self.augmentation_seed is not None:
+            seed = (int(self.augmentation_seed) + self.epoch * 1_000_003 + idx) % (
+                2**63 - 1
+            )
+            generator = torch.Generator(device="cpu").manual_seed(seed)
         return spec_augment(
             spec=spec,
             freq_mask_param=_get(self.config, "FREQ_MASK_PARAM", 15),
             time_mask_param=_get(self.config, "TIME_MASK_PARAM", 50),
             n_freq_masks=_get(self.config, "N_FREQ_MASKS", 2),
             n_time_masks=_get(self.config, "N_TIME_MASKS", 2),
+            generator=generator,
         )
 
 
@@ -149,7 +167,7 @@ class MelSpecDataset(_BaseDataset):
 
     def __getitem__(self, idx: int):
         spec = torch.from_numpy(self._load_spec(idx))
-        spec = self._maybe_augment(spec)
+        spec = self._maybe_augment(spec, idx)
         spec = spec.unsqueeze(0)
         label = torch.tensor(int(self.labels[idx]), dtype=torch.long)
         return spec, label, self._get_meta(idx)
@@ -172,7 +190,7 @@ class MelSpecSeqDataset(_BaseDataset):
 
     def __getitem__(self, idx: int):
         spec = torch.from_numpy(self._load_spec(idx))
-        spec = self._maybe_augment(spec)
+        spec = self._maybe_augment(spec, idx)
 
         usable = self.n_segments * self.segment_frames
         spec = (
@@ -225,7 +243,13 @@ def _resolve_dataset_class(mtype: str):
     """Map model type string to (DatasetClass, dataset_kwargs)."""
     if mtype in ("mlp", "cnn"):
         return MelSpecDataset, {}
-    elif mtype in ("cnn_lstm", "cnn_gru"):
+    elif mtype in (
+        "cnn_lstm",
+        "cnn_gru",  # legacy alias for the original BiGRU model
+        "cnn_bigru",
+        "cnn_bilstm",
+        "cnn_bilstm_attention",
+    ):
         return MelSpecSeqDataset, {"segment_frames": 43}
     elif mtype == "ast":
         return ASTDataset, {}
@@ -241,6 +265,7 @@ def build_dataloaders(
     config,
     model_type: str | None = None,
     batch_size: int | None = None,
+    sampler_seed: int | None = None,
 ) -> dict[str, DataLoader]:
     """
     Build train / val / test DataLoaders.
@@ -250,9 +275,12 @@ def build_dataloaders(
     manifest   : spectrogram manifest DataFrame
     config     : config module (only fixed params needed — paths, spec shape)
     model_type : "mlp" | "cnn" | "cnn_lstm" | "cnn_gru" | "ast"
-                 Falls back to config.MODEL_TYPE if not given.
+                 Supports cnn_bigru, cnn_bilstm, and
+                 cnn_bilstm_attention for the sequence comparison.
     batch_size : override batch size. Falls back to config.BATCH_SIZE
                  or 64 if neither is set.
+    sampler_seed : optional independent seed for sampler and worker RNGs.
+                   Reuse this seed across models for identical chunk draws.
     """
     mtype = (model_type or _get(config, "MODEL_TYPE", "cnn")).lower()
     bs = batch_size or _get(config, "BATCH_SIZE", 64)
@@ -277,8 +305,14 @@ def build_dataloaders(
             **dataset_kwargs,
         )
 
+        loader_generator = None
+        sampler_generator = None
+        if sampler_seed is not None:
+            loader_generator = torch.Generator().manual_seed(int(sampler_seed))
+            sampler_generator = torch.Generator().manual_seed(int(sampler_seed))
+
         if split == "train" and use_sampler:
-            sampler = _make_weighted_sampler(dataset)
+            sampler = _make_weighted_sampler(dataset, generator=sampler_generator)
             shuffle = False
         else:
             sampler = None
@@ -293,6 +327,7 @@ def build_dataloaders(
             pin_memory=pin,
             drop_last=(split == "train"),
             collate_fn=_collate_fn,
+            generator=loader_generator,
         )
 
         log.info(f"  {split:5s}: {len(dataset)} chunks | {len(loaders[split])} batches")
@@ -340,7 +375,10 @@ def build_eval_loader(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _make_weighted_sampler(dataset: _BaseDataset) -> WeightedRandomSampler:
+def _make_weighted_sampler(
+    dataset: _BaseDataset,
+    generator: torch.Generator | None = None,
+) -> WeightedRandomSampler:
     labels = dataset.labels
     n_human = (labels == 0).sum()
     n_ai = (labels == 1).sum()
@@ -351,7 +389,12 @@ def _make_weighted_sampler(dataset: _BaseDataset) -> WeightedRandomSampler:
     weights = torch.from_numpy(np.where(labels == 0, w_human, w_ai)).double()
 
     log.info(f"  WeightedSampler: human={w_human:.3f}, ai={w_ai:.3f}")
-    return WeightedRandomSampler(weights, num_samples=n_total, replacement=True)
+    return WeightedRandomSampler(
+        weights,
+        num_samples=n_total,
+        replacement=True,
+        generator=generator,
+    )
 
 
 def _collate_fn(batch):

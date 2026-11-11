@@ -148,6 +148,7 @@ def score_knn_confusion(
     embeddings: np.ndarray,
     labels: np.ndarray,
     k: int = 10,
+    query_batch_size: int = 512,
 ) -> np.ndarray:
     """
     For each chunk, find its K nearest neighbors from ALL chunks (human+AI
@@ -170,27 +171,30 @@ def score_knn_confusion(
     n = len(embeddings)
     log.info(f"Computing KNN confusion fractions (k={k}, N={n})...")
 
-    # Full similarity matrix (N, N)
-    sim_matrix = _cosine_sim(embeddings, embeddings)
+    if n < 2:
+        raise ValueError("KNN mining requires at least two training chunks.")
+    k = min(int(k), n - 1)
+    if k < 1:
+        raise ValueError("k must be positive.")
 
-    # Set self-similarity to -inf so each chunk doesn't neighbor itself
-    np.fill_diagonal(sim_matrix, -np.inf)
+    # Normalize once, then process query rows in bounded batches. This avoids
+    # materializing both an N×N similarity matrix and an N×N argsort result.
+    normalized = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
+    confusion_fracs = np.empty(n, dtype=np.float32)
+    for start in range(0, n, query_batch_size):
+        end = min(start + query_batch_size, n)
+        similarities = normalized[start:end] @ normalized.T
+        row_indices = np.arange(end - start)
+        similarities[row_indices, np.arange(start, end)] = -np.inf
 
-    # For each chunk: indices of K nearest neighbors
-    # argsort ascending → take last K for highest similarity
-    top_k_indices = np.argsort(sim_matrix, axis=1)[:, -k:]  # (N, K)
-
-    # For each chunk: labels of its K neighbors
-    neighbor_labels = labels[top_k_indices]  # (N, K)
-
-    # Fraction of neighbors from the opposite class
-    opposite_class = 1 - labels  # flip: human→1, ai→0
-    # For human (label=0): opposite=1=AI, count AI neighbors
-    # For AI    (label=1): opposite=0=human, count human neighbors
-    confusion_fracs = np.array(
-        [(neighbor_labels[i] == opposite_class[i]).mean() for i in range(n)],
-        dtype=np.float32,
-    )
+        # argpartition returns the K highest-similarity neighbors without a
+        # full per-row sort. The same opposite-class fraction is then computed.
+        top_k_indices = np.argpartition(similarities, kth=n - k, axis=1)[:, -k:]
+        neighbor_labels = labels[top_k_indices]
+        opposite_class = 1 - labels[start:end]
+        confusion_fracs[start:end] = (
+            neighbor_labels == opposite_class[:, None]
+        ).mean(axis=1)
 
     # Log summary
     human_mask = labels == 0

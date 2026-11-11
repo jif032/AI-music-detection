@@ -27,3 +27,8 @@ token_*.txt
 
 # model stats
 *.json
+
+# Publish only the consolidated comparison table and figures.
+!results/architecture_comparison/random.csv
+!results/architecture_comparison/plots/random_training_validation_curves.png
+!results/architecture_comparison/plots/random_test_metrics.png

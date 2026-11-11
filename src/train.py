@@ -293,7 +293,13 @@ def train(
     # ── Augment-free train eval loader ────────────────────────────────────
     # Built here — not passed in — so metrics are always on clean data.
     mtype = model_type.lower()
-    if mtype in ("cnn_lstm", "cnn_gru"):
+    if mtype in (
+        "cnn_lstm",
+        "cnn_gru",  # legacy alias for the original BiGRU model
+        "cnn_bigru",
+        "cnn_bilstm",
+        "cnn_bilstm_attention",
+    ):
         train_eval_ds = MelSpecSeqDataset(
             manifest=manifest,
             split="train",
@@ -373,6 +379,9 @@ def train(
         t0 = time.time()
 
         # ── Weight update pass (augmented train loader) ────────────────────
+        train_dataset = loaders["train"].dataset
+        if hasattr(train_dataset, "set_epoch"):
+            train_dataset.set_epoch(epoch - 1)
         _run_epoch(
             model,
             loaders["train"],
